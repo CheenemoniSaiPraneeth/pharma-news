@@ -1,0 +1,98 @@
+name: Pharma Intelligence Pipeline
+
+on:
+  schedule:
+    - cron: '30 4 * * *'   # 10:00 AM IST every day
+  workflow_dispatch:         # manual trigger
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp beautifulsoup4 python-dateutil certifi playwright requests
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Determine today modality
+        id: modality
+        run: |
+          python -c "
+          from datetime import date
+          import os
+          MODALITIES = ['bispecific_antibodies','monoclonal_antibodies','molecular_glues','gene_editing']
+          QUERIES = {
+            'bispecific_antibodies': 'bispecific antibody BiTE T-cell engager',
+            'monoclonal_antibodies': 'monoclonal antibody mAb therapeutic',
+            'molecular_glues':       'molecular glue PROTAC degrader TPD',
+            'gene_editing':          'CRISPR gene editing Cas9 genome',
+          }
+          today = date.today()
+          idx = today.toordinal() % len(MODALITIES)
+          mod = MODALITIES[idx]
+          query = QUERIES[mod]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'modality={mod}\n')
+              f.write(f'query={query}\n')
+          print(f'Today modality: {mod}')
+          print(f'Query: {query}')
+          "
+
+      - name: Run Stage 1 — Harvester
+        run: python run_pipeline.py --query "${{ steps.modality.outputs.query }}" --days 7 --no-summarize
+
+      - name: Run Stage 2 — Delta Engine
+        run: python merge.py
+
+      - name: Run Stage 3 — Text Extractor
+        run: |
+          python -c "
+          import json
+          from pathlib import Path
+          f = Path('allinone.json')
+          if f.exists():
+              data = json.loads(f.read_text())
+              arts = data.get('articles', [])
+              print(f'Articles ready for summarizer: {len(arts)}')
+          else:
+              print('No allinone.json found')
+          "
+
+      - name: Run Stage 4 — Summariser (bispecific antibodies)
+        if: steps.modality.outputs.modality == 'bispecific_antibodies'
+        run: python SUMMARIZER.py --input allinone.json --query "bispecific antibody BiTE T-cell engager" --output "brief_bispecific_antibodies.json"
+
+      - name: Run Stage 4 — Summariser (monoclonal antibodies)
+        if: steps.modality.outputs.modality == 'monoclonal_antibodies'
+        run: python SUMMARIZER.py --input allinone.json --query "monoclonal antibody mAb therapeutic humanized" --output "brief_monoclonal_antibodies.json"
+
+      - name: Run Stage 4 — Summariser (molecular glues)
+        if: steps.modality.outputs.modality == 'molecular_glues'
+        run: python SUMMARIZER.py --input allinone.json --query "molecular glue PROTAC targeted protein degradation TPD" --output "brief_molecular_glues.json"
+
+      - name: Run Stage 4 — Summariser (gene editing)
+        if: steps.modality.outputs.modality == 'gene_editing'
+        run: python SUMMARIZER.py --input allinone.json --query "CRISPR gene editing Cas9 base editing prime editing" --output "brief_gene_editing.json"
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git stash
+          git pull --rebase origin main
+          git stash pop
+          git add brief_*.json allinone.json || true
+          git diff --staged --quiet || git commit -m "Auto pharma brief $(date +'%Y-%m-%d')"
+          git push
