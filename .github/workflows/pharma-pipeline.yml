@@ -2,13 +2,13 @@ name: Pharma Intelligence Pipeline
 
 on:
   schedule:
-    - cron: '30 4 * * *'   # 10:00 AM IST every day
-  workflow_dispatch:         # manual trigger
+    - cron: '30 4 * * *'   # 10:00 AM IST
+  workflow_dispatch:
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repo
@@ -21,9 +21,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install aiohttp beautifulsoup4 python-dateutil certifi playwright requests
+          pip install aiohttp beautifulsoup4 python-dateutil certifi playwright requests groq
           playwright install chromium
           playwright install-deps chromium
+
+      - name: Set API keys
+        run: |
+          echo "GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}" >> $GITHUB_ENV
+          echo "NVIDIA_API_KEY=${{ secrets.NVIDIA_API_KEY }}" >> $GITHUB_ENV
 
       - name: Determine today modality
         id: modality
@@ -55,34 +60,41 @@ jobs:
       - name: Run Stage 2 — Delta Engine
         run: python merge.py
 
-      - name: Run Stage 3 — Text Extractor
+      - name: Check if new articles exist
+        id: check
         run: |
           python -c "
-          import json
+          import json, os
           from pathlib import Path
           f = Path('allinone.json')
           if f.exists():
               data = json.loads(f.read_text())
               arts = data.get('articles', [])
-              print(f'Articles ready for summarizer: {len(arts)}')
+              print(f'Articles: {len(arts)}')
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  out.write(f'count={len(arts)}\n')
           else:
-              print('No allinone.json found')
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  out.write('count=0\n')
           "
 
+      - name: Run Stage 3 — Text Extractor
+        run: echo "Articles found ${{ steps.check.outputs.count }}"
+
       - name: Run Stage 4 — Summariser (bispecific antibodies)
-        if: steps.modality.outputs.modality == 'bispecific_antibodies'
+        if: steps.modality.outputs.modality == 'bispecific_antibodies' && steps.check.outputs.count != '0'
         run: python SUMMARIZER.py --input allinone.json --query "bispecific antibody BiTE T-cell engager" --output "brief_bispecific_antibodies.json"
 
       - name: Run Stage 4 — Summariser (monoclonal antibodies)
-        if: steps.modality.outputs.modality == 'monoclonal_antibodies'
+        if: steps.modality.outputs.modality == 'monoclonal_antibodies' && steps.check.outputs.count != '0'
         run: python SUMMARIZER.py --input allinone.json --query "monoclonal antibody mAb therapeutic humanized" --output "brief_monoclonal_antibodies.json"
 
       - name: Run Stage 4 — Summariser (molecular glues)
-        if: steps.modality.outputs.modality == 'molecular_glues'
+        if: steps.modality.outputs.modality == 'molecular_glues' && steps.check.outputs.count != '0'
         run: python SUMMARIZER.py --input allinone.json --query "molecular glue PROTAC targeted protein degradation TPD" --output "brief_molecular_glues.json"
 
       - name: Run Stage 4 — Summariser (gene editing)
-        if: steps.modality.outputs.modality == 'gene_editing'
+        if: steps.modality.outputs.modality == 'gene_editing' && steps.check.outputs.count != '0'
         run: python SUMMARIZER.py --input allinone.json --query "CRISPR gene editing Cas9 base editing prime editing" --output "brief_gene_editing.json"
 
       - name: Commit and push results
